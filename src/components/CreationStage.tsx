@@ -16,6 +16,11 @@ const ERASE_RADIUS_PX = 55
 const ENGAGE_FRAMES_NEEDED = 8
 const MIN_POINT_DISTANCE_PX = 2.5
 const STROKE_END_GRACE_FRAMES = 6
+// Require the open-palm gesture to hold for a couple of frames before it
+// actually erases anything — a single noisy frame reading as an open palm
+// (relaxed fingers mid-pinch, a quick hand-shape transition) shouldn't be
+// enough to fire a destructive action.
+const WIPE_SUSTAIN_FRAMES = 2
 const LIME = '#cfff3d'
 
 type CameraStatus = 'requesting' | 'granted' | 'denied'
@@ -55,6 +60,7 @@ export function CreationStage() {
   const currentStrokeRef = useRef<Stroke | null>(null)
   const pinchModeRef = useRef<PinchMode>(null)
   const drawGapFramesRef = useRef(0)
+  const wipeSustainFramesRef = useRef(0)
   const wasPinchingRef = useRef(false)
 
   const drawFilterRef = useRef(new PointOneEuroFilter(1.2, 0.6))
@@ -296,6 +302,8 @@ export function CreationStage() {
       }
       lastGestureNameRef.current = gesture.name
 
+      wipeSustainFramesRef.current = gesture.name === 'wipe' ? wipeSustainFramesRef.current + 1 : 0
+
       let smoothedCursor: Point2D | null = null
       if (gesture.cursor) {
         const filter = gesture.name === 'draw' ? drawFilterRef.current : gesture.name === 'wipe' ? wipeFilterRef.current : pointFilterRef.current
@@ -332,8 +340,18 @@ export function CreationStage() {
           pinchModeRef.current = null
         }
 
-        if (gesture.name === 'wipe' && smoothedCursor) {
-          eraseAt(smoothedCursor, ERASE_RADIUS_PX)
+        // While a draw session is still within its grace window (see
+        // above), the user's actual intent this instant is still "I'm
+        // drawing" — a single noisy frame here can otherwise read as an
+        // open palm (fingers relaxed mid-pinch) and fire an erase right on
+        // top of the stroke just drawn, which is what caused strokes to
+        // visibly break while the pinch was still held.
+        if (pinchModeRef.current !== null) {
+          updateHovered(null)
+        } else if (gesture.name === 'wipe' && smoothedCursor) {
+          if (wipeSustainFramesRef.current > WIPE_SUSTAIN_FRAMES) {
+            eraseAt(smoothedCursor, ERASE_RADIUS_PX)
+          }
           updateHovered(null)
         } else if (gesture.name === 'point' && viewportCursor) {
           updateHovered(hitTest(viewportCursor))
