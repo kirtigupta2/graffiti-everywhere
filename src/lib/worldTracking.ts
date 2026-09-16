@@ -3,10 +3,13 @@ import type { Point2D } from '../types'
 
 const TRACK_WIDTH = 480
 const PYRAMID_LEVELS = 3
-const WIN_SIZE = 21
+const WIN_SIZE = 25
 const MAX_ITER = 24
 const EPS = 0.01
-const MIN_EIGEN_THRESHOLD = 0.0001
+// Higher than jsfeat's own default (0.0001): rejects keypoints sitting on
+// low-texture patches (bare skin, a plain wall) that are technically
+// "trackable" but noisy enough to destabilize a stroke's fitted transform.
+const MIN_EIGEN_THRESHOLD = 0.002
 
 interface Keypoint {
   x: number

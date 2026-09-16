@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useHandTracking } from '../hooks/useHandTracking'
 import { resolveGesture } from '../lib/gestures'
 import { WorldTracker } from '../lib/worldTracking'
-import { fitSimilarity, applySimilarity, applySimilarityInverse, IDENTITY_TRANSFORM, type SimilarityTransform } from '../lib/worldAnchor'
+import { fitSimilarity, applySimilarity, applySimilarityInverse, smoothTransform, IDENTITY_TRANSFORM, type SimilarityTransform } from '../lib/worldAnchor'
 import { splitPointsNear } from '../lib/strokes'
 import { videoPointToViewport } from '../lib/videoSpace'
 import { PointOneEuroFilter } from '../lib/oneEuroFilter'
@@ -178,11 +178,23 @@ export function CreationStage() {
       return { ids, origins }
     }
 
-    function getTransform(stroke: Stroke): SimilarityTransform {
+    /**
+     * Computes (or reuses) a stroke's transform for the current frame.
+     * `memo` is a per-tick cache: erase hit-testing and rendering both need
+     * a stroke's transform in the same frame, and since fitting one also
+     * advances its temporal smoothing, computing it twice in one tick would
+     * double-apply that smoothing step.
+     */
+    function getTransform(stroke: Stroke, memo: Map<string, SimilarityTransform>): SimilarityTransform {
       if (stroke.keypointIds.length === 0) return IDENTITY_TRANSFORM
 
-      const origins: Point2D[] = []
-      const currents: Point2D[] = []
+      const memoized = memo.get(stroke.id)
+      if (memoized) return memoized
+
+      const cached = transformCacheRef.current.get(stroke.id)
+
+      let origins: Point2D[] = []
+      let currents: Point2D[] = []
       for (let i = 0; i < stroke.keypointIds.length; i++) {
         const pos = worldTracker.getPosition(stroke.keypointIds[i])
         if (pos) {
@@ -192,12 +204,36 @@ export function CreationStage() {
       }
 
       if (origins.length === 0) {
-        return transformCacheRef.current.get(stroke.id) ?? IDENTITY_TRANSFORM
+        return cached ?? IDENTITY_TRANSFORM
       }
 
-      const transform = fitSimilarity(origins, currents) ?? transformCacheRef.current.get(stroke.id) ?? IDENTITY_TRANSFORM
-      transformCacheRef.current.set(stroke.id, transform)
-      return transform
+      let raw = fitSimilarity(origins, currents)
+      if (!raw) return cached ?? IDENTITY_TRANSFORM
+
+      // Single-pass outlier rejection: one keypoint whose optical-flow track
+      // drifted (e.g. it landed on a low-texture patch) can otherwise skew
+      // the whole fit. Drop the worst residual and refit if it's a clear
+      // outlier relative to the rest.
+      if (origins.length >= 3) {
+        const residuals = origins.map((o, i) => {
+          const predicted = applySimilarity(o, raw!)
+          return Math.hypot(predicted.x - currents[i].x, predicted.y - currents[i].y)
+        })
+        const sorted = [...residuals].sort((a, b) => a - b)
+        const median = sorted[Math.floor(sorted.length / 2)]
+        let worst = 0
+        for (let i = 1; i < residuals.length; i++) if (residuals[i] > residuals[worst]) worst = i
+        if (residuals[worst] > Math.max(median * 3, 10)) {
+          origins = origins.filter((_, i) => i !== worst)
+          currents = currents.filter((_, i) => i !== worst)
+          raw = fitSimilarity(origins, currents) ?? raw
+        }
+      }
+
+      const smoothed = smoothTransform(cached, raw)
+      transformCacheRef.current.set(stroke.id, smoothed)
+      memo.set(stroke.id, smoothed)
+      return smoothed
     }
 
     function dropStroke(stroke: Stroke) {
@@ -237,12 +273,12 @@ export function CreationStage() {
       stroke.keypointOrigins = origins
     }
 
-    function eraseAt(cursor: Point2D, radiusPx: number) {
+    function eraseAt(cursor: Point2D, radiusPx: number, memo: Map<string, SimilarityTransform>) {
       const next: Stroke[] = []
       let changed = false
 
       for (const stroke of strokesRef.current) {
-        const transform = getTransform(stroke)
+        const transform = getTransform(stroke, memo)
         const localCenter = applySimilarityInverse(cursor, transform)
         const localRadius = radiusPx / Math.max(transform.scale, 1e-3)
         const segments = splitPointsNear(stroke.points, localCenter, localRadius)
@@ -364,6 +400,8 @@ export function CreationStage() {
       let viewportCursor: Point2D | null = null
       if (smoothedCursor) viewportCursor = videoPointToViewport(smoothedCursor, video, media)
 
+      const frameTransforms = new Map<string, SimilarityTransform>()
+
       if (gesture.name === 'draw') {
         drawGapFramesRef.current = 0
         if (pinchModeRef.current === null) {
@@ -392,7 +430,7 @@ export function CreationStage() {
         }
 
         if (gesture.name === 'wipe' && smoothedCursor) {
-          eraseAt(smoothedCursor, ERASE_RADIUS_PX)
+          eraseAt(smoothedCursor, ERASE_RADIUS_PX, frameTransforms)
           updateHovered(null)
         } else if (gesture.name === 'point' && viewportCursor) {
           updateHovered(hitTest(viewportCursor))
@@ -403,7 +441,7 @@ export function CreationStage() {
 
       ctx.clearRect(0, 0, canvas.width, canvas.height)
       for (const stroke of strokesRef.current) {
-        const transform = getTransform(stroke)
+        const transform = getTransform(stroke, frameTransforms)
         const rendered = stroke.points.map((p) => applySimilarity(p, transform))
         const width = stroke.width * transform.scale
 
