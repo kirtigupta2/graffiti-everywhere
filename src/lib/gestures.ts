@@ -29,8 +29,11 @@ function isExtended(landmarks: NormalizedLandmark[], tip: number, pip: number, p
 // can't flicker the gesture off and on every frame. Without this, a single
 // noisy frame ends the in-progress stroke and the next frame starts a new
 // one, which is what produced the "droplet" strokes instead of one line.
-const PINCH_ENTER_RATIO = 0.38
-const PINCH_EXIT_RATIO = 0.52
+// These are deliberately tight: fingertip and thumb tip need to be nearly
+// touching (a *full* pinch) before drawing starts, so a relaxed hand or a
+// half-closed grip doesn't accidentally trigger it.
+const PINCH_ENTER_RATIO = 0.2
+const PINCH_EXIT_RATIO = 0.32
 
 /**
  * Reads one hand's landmarks and resolves it to a single gesture for this

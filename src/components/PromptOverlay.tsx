@@ -1,18 +1,18 @@
-import styles from './OnboardingOverlay.module.css'
+import type { ReactNode } from 'react'
+import styles from './PromptOverlay.module.css'
 
-interface OnboardingOverlayProps {
+interface PromptOverlayProps {
   visible: boolean
+  title: ReactNode
   message: string
-  isError: boolean
+  isError?: boolean
   onRetry?: () => void
 }
 
-export function OnboardingOverlay({ visible, message, isError, onRetry }: OnboardingOverlayProps) {
+export function PromptOverlay({ visible, title, message, isError, onRetry }: PromptOverlayProps) {
   return (
     <div className={[styles.overlay, visible ? '' : styles.hidden].join(' ').trim()}>
-      <h1 className={styles.title}>
-        Step back and show your <span className={styles.accent}>hands</span>
-      </h1>
+      <h1 className={styles.title}>{title}</h1>
       <p className={styles.hint}>{message}</p>
       {isError ? (
         <button type="button" className={styles.retry} onClick={onRetry}>
