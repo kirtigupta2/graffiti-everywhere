@@ -1,22 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useVisionTracking } from '../hooks/useVisionTracking'
+import { useHandTracking } from '../hooks/useHandTracking'
 import { resolveGesture } from '../lib/gestures'
-import { buildBodyAnchor, bodyToScreen, screenToBody } from '../lib/bodySpace'
-import { eraseNear } from '../lib/strokes'
+import { WorldTracker } from '../lib/worldTracking'
+import { fitSimilarity, applySimilarity, applySimilarityInverse, IDENTITY_TRANSFORM, type SimilarityTransform } from '../lib/worldAnchor'
+import { splitPointsNear } from '../lib/strokes'
 import { videoPointToViewport } from '../lib/videoSpace'
+import { PointOneEuroFilter } from '../lib/oneEuroFilter'
 import { PALETTE, DEFAULT_STROKE_WIDTH } from '../lib/palette'
 import { ColorPalette } from './ColorPalette'
 import { CaptureButton } from './CaptureButton'
 import { OnboardingOverlay } from './OnboardingOverlay'
-import type { BodyAnchor, GestureName, Point2D, Stroke } from '../types'
+import type { GestureName, Point2D, Stroke } from '../types'
 import styles from './CreationStage.module.css'
 
-const MAX_STROKES = 400
+const MAX_STROKES = 250
+const KEYPOINTS_PER_STROKE = 5
 const ERASE_RADIUS_PX = 55
 const ENGAGE_FRAMES_NEEDED = 8
+const MIN_POINT_DISTANCE_PX = 2.5
+const STROKE_END_GRACE_FRAMES = 6
 const LIME = '#cfff3d'
 
 type CameraStatus = 'requesting' | 'granted' | 'denied'
+type PinchMode = 'draw' | 'select' | null
+
+let strokeIdCounter = 0
+function makeStrokeId(): string {
+  return `s-${Date.now()}-${strokeIdCounter++}`
+}
 
 export function CreationStage() {
   const stageRef = useRef<HTMLDivElement>(null)
@@ -31,14 +42,24 @@ export function CreationStage() {
   const [captureFlash, setCaptureFlash] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
 
-  const vision = useVisionTracking()
+  const hand = useHandTracking()
 
   const activeColorRef = useRef(PALETTE[0].hex)
-  const anchorRef = useRef<BodyAnchor | null>(null)
+  const worldTrackerRef = useRef<WorldTracker | null>(null)
+  if (worldTrackerRef.current === null) worldTrackerRef.current = new WorldTracker()
+  const transformCacheRef = useRef(new Map<string, SimilarityTransform>())
+
   const strokesRef = useRef<Stroke[]>([])
   const currentStrokeRef = useRef<Stroke | null>(null)
-  const prevGestureRef = useRef<GestureName>('none')
-  const pinchModeRef = useRef<'draw' | 'select' | null>(null)
+  const pinchModeRef = useRef<PinchMode>(null)
+  const drawGapFramesRef = useRef(0)
+  const wasPinchingRef = useRef(false)
+
+  const drawFilterRef = useRef(new PointOneEuroFilter(1.2, 0.6))
+  const pointFilterRef = useRef(new PointOneEuroFilter(1.2, 0.6))
+  const wipeFilterRef = useRef(new PointOneEuroFilter(1.2, 0.6))
+  const lastGestureNameRef = useRef<GestureName>('none')
+
   const hoveredIdRef = useRef<string | null>(null)
   const engagedFramesRef = useRef(0)
   const engagedFiredRef = useRef(false)
@@ -109,9 +130,11 @@ export function CreationStage() {
     }
   }, [])
 
-  // Detection + draw loop.
+  // Detection + tracking + draw loop.
   useEffect(() => {
     if (cameraStatus !== 'granted') return
+
+    const worldTracker = worldTrackerRef.current!
 
     function updateHovered(id: string | null) {
       if (hoveredIdRef.current !== id) {
@@ -141,13 +164,121 @@ export function CreationStage() {
       }
     }
 
-    function drawCursor(ctx: CanvasRenderingContext2D, name: GestureName, cursor: Point2D, pinchAmount: number, scale: number) {
+    /** Picks up to KEYPOINTS_PER_STROKE points spread along a path and starts tracking them from their current on-screen position. */
+    function registerKeypoints(points: Point2D[], toCurrentSpace: (p: Point2D) => Point2D): { ids: string[]; origins: Point2D[] } {
+      const k = Math.min(KEYPOINTS_PER_STROKE, points.length)
+      const ids: string[] = []
+      const origins: Point2D[] = []
+      for (let i = 0; i < k; i++) {
+        const idx = k === 1 ? 0 : Math.round((i * (points.length - 1)) / (k - 1))
+        const origin = points[idx]
+        ids.push(worldTracker.register(toCurrentSpace(origin)))
+        origins.push(origin)
+      }
+      return { ids, origins }
+    }
+
+    function getTransform(stroke: Stroke): SimilarityTransform {
+      if (stroke.keypointIds.length === 0) return IDENTITY_TRANSFORM
+
+      const origins: Point2D[] = []
+      const currents: Point2D[] = []
+      for (let i = 0; i < stroke.keypointIds.length; i++) {
+        const pos = worldTracker.getPosition(stroke.keypointIds[i])
+        if (pos) {
+          origins.push(stroke.keypointOrigins[i])
+          currents.push(pos)
+        }
+      }
+
+      if (origins.length === 0) {
+        return transformCacheRef.current.get(stroke.id) ?? IDENTITY_TRANSFORM
+      }
+
+      const transform = fitSimilarity(origins, currents) ?? transformCacheRef.current.get(stroke.id) ?? IDENTITY_TRANSFORM
+      transformCacheRef.current.set(stroke.id, transform)
+      return transform
+    }
+
+    function dropStroke(stroke: Stroke) {
+      worldTracker.releaseAll(stroke.keypointIds)
+      transformCacheRef.current.delete(stroke.id)
+    }
+
+    function startNewStroke(point: Point2D) {
+      const stroke: Stroke = {
+        id: makeStrokeId(),
+        color: activeColorRef.current,
+        width: DEFAULT_STROKE_WIDTH,
+        points: [point],
+        keypointIds: [],
+        keypointOrigins: [],
+      }
+      currentStrokeRef.current = stroke
+      strokesRef.current.push(stroke)
+      if (strokesRef.current.length > MAX_STROKES) {
+        const dropped = strokesRef.current.shift()
+        if (dropped) dropStroke(dropped)
+      }
+    }
+
+    function appendPointIfFarEnough(stroke: Stroke, point: Point2D) {
+      const last = stroke.points[stroke.points.length - 1]
+      if (last && Math.hypot(point.x - last.x, point.y - last.y) < MIN_POINT_DISTANCE_PX) return
+      stroke.points.push(point)
+    }
+
+    function finalizeCurrentStroke() {
+      const stroke = currentStrokeRef.current
+      currentStrokeRef.current = null
+      if (!stroke) return
+      const { ids, origins } = registerKeypoints(stroke.points, (p) => p)
+      stroke.keypointIds = ids
+      stroke.keypointOrigins = origins
+    }
+
+    function eraseAt(cursor: Point2D, radiusPx: number) {
+      const next: Stroke[] = []
+      let changed = false
+
+      for (const stroke of strokesRef.current) {
+        const transform = getTransform(stroke)
+        const localCenter = applySimilarityInverse(cursor, transform)
+        const localRadius = radiusPx / Math.max(transform.scale, 1e-3)
+        const segments = splitPointsNear(stroke.points, localCenter, localRadius)
+        const survivingPoints = segments.reduce((n, s) => n + s.length, 0)
+
+        if (survivingPoints === stroke.points.length) {
+          next.push(stroke)
+          continue
+        }
+
+        changed = true
+        dropStroke(stroke)
+        for (const segment of segments) {
+          if (segment.length === 0) continue
+          const { ids, origins } = registerKeypoints(segment, (p) => applySimilarity(p, transform))
+          next.push({
+            id: makeStrokeId(),
+            color: stroke.color,
+            width: stroke.width,
+            points: segment,
+            keypointIds: ids,
+            keypointOrigins: origins,
+          })
+        }
+      }
+
+      if (changed) strokesRef.current = next
+    }
+
+    function drawCursor(ctx: CanvasRenderingContext2D, name: GestureName, cursor: Point2D, pinchAmount: number) {
       ctx.save()
       ctx.shadowBlur = 0
       if (name === 'draw') {
         ctx.fillStyle = activeColorRef.current
         ctx.beginPath()
-        ctx.arc(cursor.x, cursor.y, (DEFAULT_STROKE_WIDTH * scale) / 1.4, 0, Math.PI * 2)
+        ctx.arc(cursor.x, cursor.y, DEFAULT_STROKE_WIDTH / 1.4, 0, Math.PI * 2)
         ctx.fill()
       } else if (name === 'wipe') {
         ctx.strokeStyle = 'rgba(255,255,255,0.85)'
@@ -170,6 +301,20 @@ export function CreationStage() {
       ctx.restore()
     }
 
+    /** Strokes a smooth curve through `points` using the midpoint quadratic-curve technique, instead of raw straight segments between noisy points. */
+    function strokeSmoothPath(ctx: CanvasRenderingContext2D, points: Point2D[]) {
+      ctx.beginPath()
+      ctx.moveTo(points[0].x, points[0].y)
+      for (let i = 1; i < points.length - 1; i++) {
+        const mx = (points[i].x + points[i + 1].x) / 2
+        const my = (points[i].y + points[i + 1].y) / 2
+        ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my)
+      }
+      const last = points[points.length - 1]
+      ctx.lineTo(last.x, last.y)
+      ctx.stroke()
+    }
+
     function tick() {
       rafRef.current = requestAnimationFrame(tick)
 
@@ -185,15 +330,12 @@ export function CreationStage() {
       const ctx = canvas.getContext('2d')
       if (!ctx) return
 
-      const frame = vision.detect(video, performance.now())
-
-      if (frame.pose) {
-        const anchor = buildBodyAnchor(frame.pose, canvas.width, canvas.height)
-        if (anchor) anchorRef.current = anchor
-      }
+      const now = performance.now()
+      const handLandmarks = hand.detect(video, now)
+      worldTracker.processFrame(video)
 
       if (!engagedFiredRef.current) {
-        if (frame.hand || frame.pose) engagedFramesRef.current += 1
+        if (handLandmarks) engagedFramesRef.current += 1
         else engagedFramesRef.current = Math.max(0, engagedFramesRef.current - 1)
         if (engagedFramesRef.current > ENGAGE_FRAMES_NEEDED) {
           engagedFiredRef.current = true
@@ -201,50 +343,56 @@ export function CreationStage() {
         }
       }
 
-      const gesture = frame.hand ? resolveGesture(frame.hand, canvas.width, canvas.height) : { name: 'none' as GestureName, cursor: null, pinchAmount: 0 }
+      const gesture = handLandmarks
+        ? resolveGesture(handLandmarks, canvas.width, canvas.height, wasPinchingRef.current)
+        : { name: 'none' as GestureName, cursor: null, pinchAmount: 0 }
+      wasPinchingRef.current = gesture.name === 'draw'
+
+      if (gesture.name !== lastGestureNameRef.current) {
+        drawFilterRef.current.reset()
+        pointFilterRef.current.reset()
+        wipeFilterRef.current.reset()
+      }
+      lastGestureNameRef.current = gesture.name
+
+      let smoothedCursor: Point2D | null = null
+      if (gesture.cursor) {
+        const filter = gesture.name === 'draw' ? drawFilterRef.current : gesture.name === 'wipe' ? wipeFilterRef.current : pointFilterRef.current
+        smoothedCursor = filter.filter(gesture.cursor, now)
+      }
 
       let viewportCursor: Point2D | null = null
-      if (gesture.cursor) viewportCursor = videoPointToViewport(gesture.cursor, video, media)
-
-      const prevGesture = prevGestureRef.current
+      if (smoothedCursor) viewportCursor = videoPointToViewport(smoothedCursor, video, media)
 
       if (gesture.name === 'draw') {
-        if (prevGesture !== 'draw') {
+        drawGapFramesRef.current = 0
+        if (pinchModeRef.current === null) {
           const targetId = viewportCursor ? hitTest(viewportCursor) : null
           if (targetId) {
             pinchModeRef.current = 'select'
             runHoverAction(targetId)
           } else {
             pinchModeRef.current = 'draw'
-            currentStrokeRef.current = null
+            if (!currentStrokeRef.current && smoothedCursor) startNewStroke(smoothedCursor)
           }
         }
-        if (pinchModeRef.current === 'draw' && anchorRef.current && gesture.cursor) {
-          const bodyPoint = screenToBody(gesture.cursor, anchorRef.current)
-          if (!currentStrokeRef.current) {
-            const stroke: Stroke = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              color: activeColorRef.current,
-              width: DEFAULT_STROKE_WIDTH,
-              points: [bodyPoint],
-            }
-            currentStrokeRef.current = stroke
-            strokesRef.current.push(stroke)
-            if (strokesRef.current.length > MAX_STROKES) strokesRef.current.shift()
-          } else {
-            currentStrokeRef.current.points.push(bodyPoint)
-          }
+        if (pinchModeRef.current === 'draw' && currentStrokeRef.current && smoothedCursor) {
+          appendPointIfFarEnough(currentStrokeRef.current, smoothedCursor)
         }
         updateHovered(null)
       } else {
-        if (prevGesture === 'draw') {
-          currentStrokeRef.current = null
+        if (pinchModeRef.current === 'draw') {
+          drawGapFramesRef.current += 1
+          if (drawGapFramesRef.current > STROKE_END_GRACE_FRAMES) {
+            finalizeCurrentStroke()
+            pinchModeRef.current = null
+          }
+        } else if (pinchModeRef.current === 'select') {
           pinchModeRef.current = null
         }
-        if (gesture.name === 'wipe' && anchorRef.current && gesture.cursor) {
-          const bodyPoint = screenToBody(gesture.cursor, anchorRef.current)
-          const radius = ERASE_RADIUS_PX / anchorRef.current.scale
-          strokesRef.current = eraseNear(strokesRef.current, bodyPoint, radius)
+
+        if (gesture.name === 'wipe' && smoothedCursor) {
+          eraseAt(smoothedCursor, ERASE_RADIUS_PX)
           updateHovered(null)
         } else if (gesture.name === 'point' && viewportCursor) {
           updateHovered(hitTest(viewportCursor))
@@ -252,44 +400,34 @@ export function CreationStage() {
           updateHovered(null)
         }
       }
-      prevGestureRef.current = gesture.name
 
       ctx.clearRect(0, 0, canvas.width, canvas.height)
-      const anchor = anchorRef.current
-      if (anchor) {
-        for (const stroke of strokesRef.current) {
-          if (stroke.points.length === 0) continue
-          const lineWidth = stroke.width * anchor.scale
-          if (stroke.points.length === 1) {
-            const p = bodyToScreen(stroke.points[0], anchor)
-            ctx.fillStyle = stroke.color
-            ctx.shadowColor = stroke.color
-            ctx.shadowBlur = 14
-            ctx.beginPath()
-            ctx.arc(p.x, p.y, lineWidth / 2, 0, Math.PI * 2)
-            ctx.fill()
-            continue
-          }
-          ctx.strokeStyle = stroke.color
-          ctx.shadowColor = stroke.color
-          ctx.shadowBlur = 14
-          ctx.lineWidth = lineWidth
-          ctx.lineCap = 'round'
-          ctx.lineJoin = 'round'
-          ctx.beginPath()
-          const first = bodyToScreen(stroke.points[0], anchor)
-          ctx.moveTo(first.x, first.y)
-          for (let i = 1; i < stroke.points.length; i++) {
-            const p = bodyToScreen(stroke.points[i], anchor)
-            ctx.lineTo(p.x, p.y)
-          }
-          ctx.stroke()
-        }
-        ctx.shadowBlur = 0
+      for (const stroke of strokesRef.current) {
+        const transform = getTransform(stroke)
+        const rendered = stroke.points.map((p) => applySimilarity(p, transform))
+        const width = stroke.width * transform.scale
 
-        if (gesture.cursor) {
-          drawCursor(ctx, gesture.name, gesture.cursor, gesture.pinchAmount, anchor.scale)
+        ctx.strokeStyle = stroke.color
+        ctx.fillStyle = stroke.color
+        ctx.shadowColor = stroke.color
+        ctx.shadowBlur = 14
+
+        if (rendered.length === 1) {
+          ctx.beginPath()
+          ctx.arc(rendered[0].x, rendered[0].y, width / 2, 0, Math.PI * 2)
+          ctx.fill()
+          continue
         }
+
+        ctx.lineWidth = width
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        strokeSmoothPath(ctx, rendered)
+      }
+      ctx.shadowBlur = 0
+
+      if (smoothedCursor) {
+        drawCursor(ctx, gesture.name, smoothedCursor, gesture.pinchAmount)
       }
     }
 
@@ -297,7 +435,7 @@ export function CreationStage() {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
-  }, [cameraStatus, vision, capture])
+  }, [cameraStatus, hand, capture])
 
   const overlayVisible = !bodyEngaged
   let overlayMessage = 'Fingers are your marker. Pinch to draw, open your palm to wipe.'
@@ -307,11 +445,11 @@ export function CreationStage() {
     overlayMessage = 'Camera access is blocked. Allow camera permissions in your browser and try again.'
   } else if (cameraStatus === 'requesting') {
     overlayMessage = 'Waking up your camera…'
-  } else if (vision.status === 'error') {
+  } else if (hand.status === 'error') {
     overlayError = true
     overlayMessage = 'Hand tracking failed to load. Check your connection and try again.'
-  } else if (vision.status === 'loading') {
-    overlayMessage = 'Loading hand + body tracking…'
+  } else if (hand.status === 'loading') {
+    overlayMessage = 'Loading hand tracking…'
   }
 
   return (

@@ -9,4 +9,5 @@ export const PALETTE: SwatchColor[] = [
   { id: 'white', label: 'Chalk', hex: '#ffffff' },
 ]
 
-export const DEFAULT_STROKE_WIDTH = 0.028
+/** Line width in raw video-pixel units (the video is typically ~1920px wide). */
+export const DEFAULT_STROKE_WIDTH = 14

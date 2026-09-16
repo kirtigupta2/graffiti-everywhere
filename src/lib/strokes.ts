@@ -1,33 +1,27 @@
-import type { Stroke, StrokePoint } from '../types'
+import type { Point2D } from '../types'
 
 /**
- * Removes any stroke points within `radius` of `center` (both in body
- * space). A stroke that gets cut in the middle is split into two so the
- * remaining pieces don't snap together into a straight line.
+ * Splits a point path at any point within `radius` of `center` (both in
+ * the same coordinate space as `points`), dropping the erased points. A
+ * path cut in the middle becomes two separate pieces instead of one that
+ * jumps straight across the gap.
  */
-export function eraseNear(strokes: Stroke[], center: StrokePoint, radius: number): Stroke[] {
-  const result: Stroke[] = []
+export function splitPointsNear(points: Point2D[], center: Point2D, radius: number): Point2D[][] {
+  const segments: Point2D[][] = []
+  let current: Point2D[] = []
 
-  for (const stroke of strokes) {
-    let current: StrokePoint[] = []
-    let part = 0
-
-    for (const point of stroke.points) {
-      const hit = Math.hypot(point.x - center.x, point.y - center.y) < radius
-      if (hit) {
-        if (current.length > 0) {
-          result.push({ ...stroke, id: `${stroke.id}-${part++}`, points: current })
-          current = []
-        }
-      } else {
-        current.push(point)
+  for (const point of points) {
+    const hit = Math.hypot(point.x - center.x, point.y - center.y) < radius
+    if (hit) {
+      if (current.length > 0) {
+        segments.push(current)
+        current = []
       }
-    }
-
-    if (current.length > 0) {
-      result.push(current.length === stroke.points.length ? stroke : { ...stroke, id: `${stroke.id}-${part}`, points: current })
+    } else {
+      current.push(point)
     }
   }
+  if (current.length > 0) segments.push(current)
 
-  return result
+  return segments
 }

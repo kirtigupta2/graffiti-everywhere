@@ -24,11 +24,26 @@ function isExtended(landmarks: NormalizedLandmark[], tip: number, pip: number, p
   return dist(landmarks[tip], wrist) - dist(landmarks[pip], wrist) > palmSize * 0.08
 }
 
+// Hysteresis on the pinch distance: a smaller threshold to *start* a pinch
+// than to *end* one, so hand-tracking noise hovering right at the boundary
+// can't flicker the gesture off and on every frame. Without this, a single
+// noisy frame ends the in-progress stroke and the next frame starts a new
+// one, which is what produced the "droplet" strokes instead of one line.
+const PINCH_ENTER_RATIO = 0.38
+const PINCH_EXIT_RATIO = 0.52
+
 /**
- * Reads one hand's landmarks and resolves it to a single gesture for this frame.
- * Priority: draw (pinch) > wipe (open palm swipe) > point (index only) > none.
+ * Reads one hand's landmarks and resolves it to a single gesture for this
+ * frame. Priority: draw (pinch) > wipe (open palm swipe) > point (index
+ * only) > none. `wasPinching` is the previous frame's pinch state, used to
+ * apply hysteresis around the pinch threshold.
  */
-export function resolveGesture(landmarks: NormalizedLandmark[], videoWidth: number, videoHeight: number): GestureState {
+export function resolveGesture(
+  landmarks: NormalizedLandmark[],
+  videoWidth: number,
+  videoHeight: number,
+  wasPinching: boolean,
+): GestureState {
   const wrist = landmarks[WRIST]
   const palmSize = dist(wrist, landmarks[MIDDLE_MCP]) || 0.001
 
@@ -40,7 +55,8 @@ export function resolveGesture(landmarks: NormalizedLandmark[], videoWidth: numb
   const ringOut = isExtended(landmarks, RING_TIP, RING_PIP, palmSize)
   const pinkyOut = isExtended(landmarks, PINKY_TIP, PINKY_PIP, palmSize)
 
-  const isPinching = pinchDist < palmSize * 0.42
+  const pinchThreshold = palmSize * (wasPinching ? PINCH_EXIT_RATIO : PINCH_ENTER_RATIO)
+  const isPinching = pinchDist < pinchThreshold
   const fingersExtendedCount = [indexOut, middleOut, ringOut, pinkyOut].filter(Boolean).length
 
   let name: GestureName = 'none'
