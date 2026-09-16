@@ -18,13 +18,7 @@ export interface Stroke {
   color: string
   /** Line width in raw video-pixel units, at the moment it was drawn. */
   width: number
-  /**
-   * Points in raw video-pixel space, at the moment they were drawn. Every
-   * stroke shares the single session anchor (see worldAnchor.ts /
-   * CreationStage's anchor tracking) — there's one transform per frame,
-   * not one per stroke, so these points always render through the same
-   * mapping as every other stroke.
-   */
+  /** Points in raw video-pixel space, rendered at those exact coordinates every frame — the canvas is a fixed overlay on the video, not tracked. */
   points: Point2D[]
 }
 

@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useHandTracking } from '../hooks/useHandTracking'
 import { resolveGesture } from '../lib/gestures'
-import { WorldTracker } from '../lib/worldTracking'
-import { fitSimilarity, applySimilarity, applySimilarityInverse, smoothTransform, IDENTITY_TRANSFORM, type SimilarityTransform } from '../lib/worldAnchor'
 import { splitPointsNear } from '../lib/strokes'
 import { videoPointToViewport } from '../lib/videoSpace'
 import { PointOneEuroFilter } from '../lib/oneEuroFilter'
@@ -10,7 +8,6 @@ import { PALETTE, DEFAULT_STROKE_WIDTH } from '../lib/palette'
 import { ColorPalette } from './ColorPalette'
 import { CaptureButton } from './CaptureButton'
 import { PromptOverlay } from './PromptOverlay'
-import { AnchorSelectOverlay } from './AnchorSelectOverlay'
 import type { GestureName, Point2D, Stroke } from '../types'
 import styles from './CreationStage.module.css'
 
@@ -19,15 +16,9 @@ const ERASE_RADIUS_PX = 55
 const ENGAGE_FRAMES_NEEDED = 8
 const MIN_POINT_DISTANCE_PX = 2.5
 const STROKE_END_GRACE_FRAMES = 6
-// Spacing (video-pixels) of the 3x3 keypoint grid the single session anchor
-// is tracked with. Deliberately wide: a bigger spread makes the anchor's
-// rotation/scale fit far better conditioned (see MIN_SPREAD_PX in
-// worldAnchor.ts) than anything a single short stroke could offer.
-const ANCHOR_GRID_SPACING_PX = 60
 const LIME = '#cfff3d'
 
 type CameraStatus = 'requesting' | 'granted' | 'denied'
-type Phase = 'onboarding' | 'selectAnchor' | 'pickSurfacePoint' | 'drawing'
 type PinchMode = 'draw' | 'select' | null
 
 let strokeIdCounter = 0
@@ -35,10 +26,15 @@ function makeStrokeId(): string {
   return `s-${Date.now()}-${strokeIdCounter++}`
 }
 
-function clampNum(v: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, v))
-}
-
+/**
+ * The canvas is the video frame itself, treated as a fixed sheet — like a
+ * transparent layer painted directly onto a plain wall behind you. Strokes
+ * are stored and rendered at the exact video-pixel coordinates they were
+ * drawn at, with no per-frame tracking or transform. That's deliberate: a
+ * stationary webcam means the background genuinely doesn't move in frame,
+ * so "stick to what it was drawn on" falls out for free and reliably,
+ * instead of depending on a live vision fit that can drift or misfire.
+ */
 export function CreationStage() {
   const stageRef = useRef<HTMLDivElement>(null)
   const mediaLayerRef = useRef<HTMLDivElement>(null)
@@ -46,7 +42,7 @@ export function CreationStage() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>('requesting')
-  const [phase, setPhase] = useState<Phase>('onboarding')
+  const [bodyEngaged, setBodyEngaged] = useState(false)
   const [activeColorId, setActiveColorId] = useState(PALETTE[0].id)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [captureFlash, setCaptureFlash] = useState(false)
@@ -54,21 +50,7 @@ export function CreationStage() {
 
   const hand = useHandTracking()
 
-  const phaseRef = useRef<Phase>('onboarding')
-  useEffect(() => {
-    phaseRef.current = phase
-  }, [phase])
-
   const activeColorRef = useRef(PALETTE[0].hex)
-  const worldTrackerRef = useRef<WorldTracker | null>(null)
-  if (worldTrackerRef.current === null) worldTrackerRef.current = new WorldTracker()
-
-  // The single anchor for the whole session: one small grid of tracked
-  // keypoints, one fitted transform per frame, shared by every stroke.
-  const anchorKeypointIdsRef = useRef<string[]>([])
-  const anchorKeypointOriginsRef = useRef<Point2D[]>([])
-  const anchorTransformRef = useRef<SimilarityTransform | undefined>(undefined)
-
   const strokesRef = useRef<Stroke[]>([])
   const currentStrokeRef = useRef<Stroke | null>(null)
   const pinchModeRef = useRef<PinchMode>(null)
@@ -84,24 +66,6 @@ export function CreationStage() {
   const engagedFramesRef = useRef(0)
   const engagedFiredRef = useRef(false)
   const rafRef = useRef<number | null>(null)
-
-  /** Places the one session anchor: a 3x3 grid of keypoints centered on `center`, tracked from now on. Lives at component scope so both the mouse-click "on yourself" path and the gesture-driven "pinch a surface" path can call the same logic. */
-  const placeAnchor = useCallback((center: Point2D, videoWidth: number, videoHeight: number) => {
-    const tracker = worldTrackerRef.current!
-    const offsets = [-1, 0, 1]
-    const points: Point2D[] = []
-    for (const oy of offsets) {
-      for (const ox of offsets) {
-        points.push({
-          x: clampNum(center.x + ox * ANCHOR_GRID_SPACING_PX, 24, videoWidth - 24),
-          y: clampNum(center.y + oy * ANCHOR_GRID_SPACING_PX, 24, videoHeight - 24),
-        })
-      }
-    }
-    anchorKeypointIdsRef.current = points.map((p) => tracker.register(p))
-    anchorKeypointOriginsRef.current = points
-    anchorTransformRef.current = undefined
-  }, [])
 
   useEffect(() => {
     activeColorRef.current = PALETTE.find((c) => c.id === activeColorId)?.hex ?? PALETTE[0].hex
@@ -168,11 +132,9 @@ export function CreationStage() {
     }
   }, [])
 
-  // Detection + tracking + draw loop.
+  // Detection + draw loop.
   useEffect(() => {
     if (cameraStatus !== 'granted') return
-
-    const worldTracker = worldTrackerRef.current!
 
     function updateHovered(id: string | null) {
       if (hoveredIdRef.current !== id) {
@@ -202,50 +164,6 @@ export function CreationStage() {
       }
     }
 
-    function getAnchorTransform(): SimilarityTransform {
-      const ids = anchorKeypointIdsRef.current
-      if (ids.length === 0) return IDENTITY_TRANSFORM
-
-      const cached = anchorTransformRef.current
-      let origins: Point2D[] = []
-      let currents: Point2D[] = []
-      for (let i = 0; i < ids.length; i++) {
-        const pos = worldTracker.getPosition(ids[i])
-        if (pos) {
-          origins.push(anchorKeypointOriginsRef.current[i])
-          currents.push(pos)
-        }
-      }
-
-      if (origins.length === 0) return cached ?? IDENTITY_TRANSFORM
-
-      let raw = fitSimilarity(origins, currents)
-      if (!raw) return cached ?? IDENTITY_TRANSFORM
-
-      // Single-pass outlier rejection: one keypoint whose optical-flow track
-      // drifted can otherwise skew the whole anchor. Drop the worst residual
-      // and refit if it's a clear outlier relative to the rest.
-      if (origins.length >= 3) {
-        const residuals = origins.map((o, i) => {
-          const predicted = applySimilarity(o, raw!)
-          return Math.hypot(predicted.x - currents[i].x, predicted.y - currents[i].y)
-        })
-        const sorted = [...residuals].sort((a, b) => a - b)
-        const median = sorted[Math.floor(sorted.length / 2)]
-        let worst = 0
-        for (let i = 1; i < residuals.length; i++) if (residuals[i] > residuals[worst]) worst = i
-        if (residuals[worst] > Math.max(median * 3, 10)) {
-          origins = origins.filter((_, i) => i !== worst)
-          currents = currents.filter((_, i) => i !== worst)
-          raw = fitSimilarity(origins, currents) ?? raw
-        }
-      }
-
-      const smoothed = smoothTransform(cached, raw)
-      anchorTransformRef.current = smoothed
-      return smoothed
-    }
-
     function startNewStroke(point: Point2D) {
       const stroke: Stroke = {
         id: makeStrokeId(),
@@ -264,14 +182,12 @@ export function CreationStage() {
       stroke.points.push(point)
     }
 
-    function eraseAt(cursor: Point2D, radiusPx: number, transform: SimilarityTransform) {
-      const localCenter = applySimilarityInverse(cursor, transform)
-      const localRadius = radiusPx / Math.max(transform.scale, 1e-3)
+    function eraseAt(cursor: Point2D, radiusPx: number) {
       const next: Stroke[] = []
       let changed = false
 
       for (const stroke of strokesRef.current) {
-        const segments = splitPointsNear(stroke.points, localCenter, localRadius)
+        const segments = splitPointsNear(stroke.points, cursor, radiusPx)
         const survivingPoints = segments.reduce((n, s) => n + s.length, 0)
 
         if (survivingPoints === stroke.points.length) {
@@ -349,14 +265,13 @@ export function CreationStage() {
 
       const now = performance.now()
       const handLandmarks = hand.detect(video, now)
-      worldTracker.processFrame(video)
 
       if (!engagedFiredRef.current) {
         if (handLandmarks) engagedFramesRef.current += 1
         else engagedFramesRef.current = Math.max(0, engagedFramesRef.current - 1)
         if (engagedFramesRef.current > ENGAGE_FRAMES_NEEDED) {
           engagedFiredRef.current = true
-          setPhase('selectAnchor')
+          setBodyEngaged(true)
         }
       }
 
@@ -374,8 +289,7 @@ export function CreationStage() {
         : { name: 'none' as GestureName, cursor: null, pinchAmount: 0 }
       wasPinchingRef.current = gesture.name === 'draw'
 
-      const prevGestureName = lastGestureNameRef.current
-      if (gesture.name !== prevGestureName) {
+      if (gesture.name !== lastGestureNameRef.current) {
         drawFilterRef.current.reset()
         pointFilterRef.current.reset()
         wipeFilterRef.current.reset()
@@ -391,98 +305,63 @@ export function CreationStage() {
       let viewportCursor: Point2D | null = null
       if (smoothedCursor) viewportCursor = videoPointToViewport(smoothedCursor, video, media)
 
-      const transform = getAnchorTransform()
-
-      switch (phaseRef.current) {
-        case 'selectAnchor': {
-          if (gesture.name === 'draw') {
-            if (prevGestureName !== 'draw') {
-              const targetId = viewportCursor ? hitTest(viewportCursor) : null
-              if (targetId === 'anchor-body') {
-                placeAnchor({ x: canvas.width / 2, y: canvas.height / 2 }, canvas.width, canvas.height)
-                setPhase('drawing')
-              } else if (targetId === 'anchor-surface') {
-                setPhase('pickSurfacePoint')
-              }
-            }
-            updateHovered(null)
-          } else if (gesture.name === 'point' && viewportCursor) {
-            updateHovered(hitTest(viewportCursor))
+      if (gesture.name === 'draw') {
+        drawGapFramesRef.current = 0
+        if (pinchModeRef.current === null) {
+          const targetId = viewportCursor ? hitTest(viewportCursor) : null
+          if (targetId) {
+            pinchModeRef.current = 'select'
+            runHoverAction(targetId)
           } else {
-            updateHovered(null)
+            pinchModeRef.current = 'draw'
+            if (!currentStrokeRef.current && smoothedCursor) startNewStroke(smoothedCursor)
           }
-          break
         }
-        case 'pickSurfacePoint': {
-          if (gesture.name === 'draw' && prevGestureName !== 'draw' && smoothedCursor) {
-            placeAnchor(smoothedCursor, canvas.width, canvas.height)
-            setPhase('drawing')
+        if (pinchModeRef.current === 'draw' && currentStrokeRef.current && smoothedCursor) {
+          appendPointIfFarEnough(currentStrokeRef.current, smoothedCursor)
+        }
+        updateHovered(null)
+      } else {
+        if (pinchModeRef.current === 'draw') {
+          drawGapFramesRef.current += 1
+          if (drawGapFramesRef.current > STROKE_END_GRACE_FRAMES) {
+            currentStrokeRef.current = null
+            pinchModeRef.current = null
           }
+        } else if (pinchModeRef.current === 'select') {
+          pinchModeRef.current = null
+        }
+
+        if (gesture.name === 'wipe' && smoothedCursor) {
+          eraseAt(smoothedCursor, ERASE_RADIUS_PX)
           updateHovered(null)
-          break
-        }
-        case 'drawing': {
-          if (gesture.name === 'draw') {
-            drawGapFramesRef.current = 0
-            if (pinchModeRef.current === null) {
-              const targetId = viewportCursor ? hitTest(viewportCursor) : null
-              if (targetId) {
-                pinchModeRef.current = 'select'
-                runHoverAction(targetId)
-              } else {
-                pinchModeRef.current = 'draw'
-                if (!currentStrokeRef.current && smoothedCursor) startNewStroke(smoothedCursor)
-              }
-            }
-            if (pinchModeRef.current === 'draw' && currentStrokeRef.current && smoothedCursor) {
-              appendPointIfFarEnough(currentStrokeRef.current, smoothedCursor)
-            }
-            updateHovered(null)
-          } else {
-            if (pinchModeRef.current === 'draw') {
-              drawGapFramesRef.current += 1
-              if (drawGapFramesRef.current > STROKE_END_GRACE_FRAMES) {
-                currentStrokeRef.current = null
-                pinchModeRef.current = null
-              }
-            } else if (pinchModeRef.current === 'select') {
-              pinchModeRef.current = null
-            }
-
-            if (gesture.name === 'wipe' && smoothedCursor) {
-              eraseAt(smoothedCursor, ERASE_RADIUS_PX, transform)
-              updateHovered(null)
-            } else if (gesture.name === 'point' && viewportCursor) {
-              updateHovered(hitTest(viewportCursor))
-            } else {
-              updateHovered(null)
-            }
-          }
-          break
+        } else if (gesture.name === 'point' && viewportCursor) {
+          updateHovered(hitTest(viewportCursor))
+        } else {
+          updateHovered(null)
         }
       }
 
       ctx.clearRect(0, 0, canvas.width, canvas.height)
       for (const stroke of strokesRef.current) {
-        const rendered = stroke.points.map((p) => applySimilarity(p, transform))
-        const width = stroke.width * transform.scale
+        const points = stroke.points
 
         ctx.strokeStyle = stroke.color
         ctx.fillStyle = stroke.color
         ctx.shadowColor = stroke.color
         ctx.shadowBlur = 14
 
-        if (rendered.length === 1) {
+        if (points.length === 1) {
           ctx.beginPath()
-          ctx.arc(rendered[0].x, rendered[0].y, width / 2, 0, Math.PI * 2)
+          ctx.arc(points[0].x, points[0].y, stroke.width / 2, 0, Math.PI * 2)
           ctx.fill()
           continue
         }
 
-        ctx.lineWidth = width
+        ctx.lineWidth = stroke.width
         ctx.lineCap = 'round'
         ctx.lineJoin = 'round'
-        strokeSmoothPath(ctx, rendered)
+        strokeSmoothPath(ctx, points)
       }
       ctx.shadowBlur = 0
 
@@ -495,21 +374,21 @@ export function CreationStage() {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
-  }, [cameraStatus, hand, capture, placeAnchor])
+  }, [cameraStatus, hand, capture])
 
-  const onboardingVisible = phase === 'onboarding'
-  let onboardingMessage = 'Fingers are your marker. Pinch to draw, open your palm to wipe.'
-  let onboardingError = false
+  const overlayVisible = !bodyEngaged
+  let overlayMessage = 'Sit against a plain wall or background — that’s your canvas. Pinch fully to draw, open your palm to wipe.'
+  let overlayError = false
   if (cameraStatus === 'denied') {
-    onboardingError = true
-    onboardingMessage = 'Camera access is blocked. Allow camera permissions in your browser and try again.'
+    overlayError = true
+    overlayMessage = 'Camera access is blocked. Allow camera permissions in your browser and try again.'
   } else if (cameraStatus === 'requesting') {
-    onboardingMessage = 'Waking up your camera…'
+    overlayMessage = 'Waking up your camera…'
   } else if (hand.status === 'error') {
-    onboardingError = true
-    onboardingMessage = 'Hand tracking failed to load. Check your connection and try again.'
+    overlayError = true
+    overlayMessage = 'Hand tracking failed to load. Check your connection and try again.'
   } else if (hand.status === 'loading') {
-    onboardingMessage = 'Loading hand tracking…'
+    overlayMessage = 'Loading hand tracking…'
   }
 
   return (
@@ -525,41 +404,22 @@ export function CreationStage() {
 
       {toast && <div className={styles.toast}>{toast}</div>}
 
-      {phase === 'drawing' && (
+      {bodyEngaged && (
         <>
           <ColorPalette activeColorId={activeColorId} hoveredId={hoveredId} onSelect={setActiveColorId} />
           <CaptureButton hovered={hoveredId === 'capture'} flash={captureFlash} onCapture={capture} />
         </>
       )}
 
-      {phase === 'selectAnchor' && (
-        <AnchorSelectOverlay
-          hoveredId={hoveredId}
-          onSelectBody={() => {
-            const canvas = canvasRef.current
-            if (!canvas) return
-            placeAnchor({ x: canvas.width / 2, y: canvas.height / 2 }, canvas.width, canvas.height)
-            setPhase('drawing')
-          }}
-          onSelectSurface={() => setPhase('pickSurfacePoint')}
-        />
-      )}
-
       <PromptOverlay
-        visible={phase === 'pickSurfacePoint'}
-        title="Pick your spot"
-        message="Pinch anywhere on the background, an object, or another person to anchor your drawing there."
-      />
-
-      <PromptOverlay
-        visible={onboardingVisible}
+        visible={overlayVisible}
         title={
           <>
             Step back and show your <span className={styles.accentInline}>hands</span>
           </>
         }
-        message={onboardingMessage}
-        isError={onboardingError}
+        message={overlayMessage}
+        isError={overlayError}
         onRetry={() => window.location.reload()}
       />
     </div>

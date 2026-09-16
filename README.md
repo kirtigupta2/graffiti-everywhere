@@ -1,31 +1,30 @@
 # Graffit You
 
-A frictionless, browser-based desktop AR mirror. Point a laptop webcam at
-yourself, and your fingers become a marker: pinch to draw neon strokes that
-stick to your body as you move, open your palm to wipe them away, and point
-+ pinch to pick colors from a floating palette or snap a capture.
+A frictionless, browser-based desktop AR mirror. Point a laptop webcam at a
+plain wall or background, and your fingers become a marker: pinch to draw
+neon strokes, open your palm to wipe them away, and point + pinch to pick
+colors from a floating palette or snap a capture.
 
 ## How it works
 
 - **Hand tracking** — [MediaPipe Tasks Vision](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker)
   `HandLandmarker` reads finger landmarks every frame to resolve a gesture:
   pinch (draw), open palm (wipe), or a pointing finger (hover the UI). Pinch
-  detection uses hysteresis (a smaller distance to *start* a pinch than to
-  *end* one) so hand-tracking noise at the threshold can't flicker the
-  gesture and fragment a stroke into disconnected pieces.
-- **World-glued strokes** — once a stroke is finished, a handful of points
-  along it are handed to a sparse optical-flow tracker
-  ([jsfeat](https://inspirit.github.io/jsfeat/)'s pyramidal Lucas-Kanade,
-  the same family of algorithm real AR "sticker" tools use) that follows
-  those exact pixels frame to frame on a downscaled grayscale copy of the
-  video. Each stroke fits a 2D similarity transform (rotation + uniform
-  scale + translation) from where those points started to where they are
-  now, and renders itself through that transform — so it stays glued to
-  whatever it was actually drawn on (skin, clothing, a mug on the desk, the
-  wall behind you), not to a fixed region of the screen or a single rigid
-  body frame. Wiping splits a stroke's remaining pieces and re-anchors each
-  one from its current on-screen position, so cut pieces keep tracking
-  independently.
+  detection requires a genuinely full pinch (fingertip and thumb tip close
+  to touching) and uses hysteresis — a tighter distance to *start* a pinch
+  than to *end* one — so hand-tracking noise at the threshold can't flicker
+  the gesture and fragment a stroke into disconnected pieces. Drawing only
+  ever runs once onboarding has fully engaged, so hand-tracking warm-up
+  noise can't leave a stray mark before you've even started.
+- **Fixed-coordinate canvas** — strokes are stored and rendered at the exact
+  video-pixel coordinates they were drawn at, every frame, with no live
+  tracking or per-frame transform. Since a laptop webcam is stationary, the
+  wall or background behind you genuinely doesn't move in frame, so a plain
+  fixed overlay is enough to make drawings "stick" reliably — no drift, and
+  no per-frame fit that can misfire. (We tried a fancier version — glueing
+  strokes to a moving person or object via live optical-flow tracking — but
+  it kept trading one instability for another, so we deliberately kept this
+  simple and dependable instead.)
 - **Smooth strokes** — the live cursor runs through a
   [1€ filter](https://cristal.univ-lille.fr/~casiez/1euro/) (adaptive
   low-pass smoothing that backs off during fast motion so it doesn't add
@@ -35,7 +34,7 @@ stick to your body as you move, open your palm to wipe them away, and point
   of a jittery, beaded one.
 - **Selection** — pointing at a palette swatch or the capture button and
   then pinching selects it, the same way you'd pinch to draw, just aimed at
-  the UI instead of the world.
+  the UI instead of the wall.
 - **Capture** — composites the mirrored camera frame and the strokes canvas
   into a PNG and downloads it.
 
@@ -59,12 +58,10 @@ src/
   components/CreationStage.tsx   camera + canvas + gesture loop + UI
   components/ColorPalette.tsx    floating swatch palette
   components/CaptureButton.tsx   pinch-to-capture button
-  components/OnboardingOverlay.tsx
+  components/PromptOverlay.tsx   onboarding / status prompt
   hooks/useHandTracking.ts       loads MediaPipe HandLandmarker
-  lib/gestures.ts                pinch (with hysteresis) / open-palm / point detection
+  lib/gestures.ts                pinch (full-pinch + hysteresis) / open-palm / point detection
   lib/oneEuroFilter.ts           adaptive cursor smoothing
-  lib/worldTracking.ts           sparse optical-flow keypoint tracker (jsfeat)
-  lib/worldAnchor.ts             least-squares 2D similarity transform fit/apply
   lib/strokes.ts                 point-path splitting for erase
   lib/videoSpace.ts              video-pixel <-> viewport coordinate mapping
   lib/palette.ts                 brand color swatches
